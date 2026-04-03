@@ -111,3 +111,7 @@ func asUser(f func() (int, error), context *fuse.Context) (int, error) {
 ```
 
 Alternatively, detect user namespace remapping by comparing `/proc/<pid>/ns/user` of the requesting process against the daemon's own namespace and force credential switching for cross-namespace requests.
+
+---
+
+**Full PoC and scripts**: [GitHub Repository](https://github.com/APEvul-cyber/FUSE_gocryptfs_vul/tree/main/FUSE_IN_HEADER_uid_response)

@@ -82,3 +82,7 @@ return f()
 ```
 
 This ensures namespace-remapped `uid=0` processes do not inherit the daemon's root privileges.
+
+---
+
+**Full PoC and scripts**: [GitHub Repository](https://github.com/APEvul-cyber/FUSE_gocryptfs_vul/tree/main/FUSE_IN_HEADER_uid_response)
