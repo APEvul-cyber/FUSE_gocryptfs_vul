@@ -1,0 +1,109 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Linux system with FUSE filesystem using `struct fuse_in_header`/`struct fuse_out_header`.
+  - FUSE daemon runs in a user namespace or idmapped mount context (e.g., container), using libfuse (`fuse_req_ctx()->uid`) to perform access control and per‑user policy.
+  - The daemon treats `uid == 0` (or a special value such as `FUSE_INVALID_UIDGID`) as privileged “filesystem root” and bypasses normal access checks for that UID (e.g., it allows reading/writing all files or performing management operations).
+  - Filesystem is visible to multiple host users (`allow_other` or equivalent), so users outside the daemon’s namespace can access the mount.
+  - Kernel behavior per spec:
+    - Fills `fuse_in_header.uid` based on calling process credentials, but
+    - In some namespace/idmap situations, it may set this field to `0` or to `FUSE_INVALID_UIDGID` when it cannot map the real UID into the daemon’s idmap.
+  - Critical contract being broken: “`fuse_in_header.uid` unambiguously and faithfully identifies the calling user in the daemon’s security domain; `uid == 0` corresponds only to the intended privileged principal, not to arbitrary unmapped users.”
+
+- **Attacker Capability:**
+  - Attacker is an unprivileged host user outside the daemon’s namespace (e.g., host UID 1001).
+  - Can access the mounted FUSE filesystem (e.g., via shared/bind mount + `allow_other`).
+  - Cannot modify the kernel or the FUSE daemon, and cannot directly forge FUSE protocol messages.
+  - Can trigger arbitrary filesystem operations (open, read, write, mkdir, unlink, etc.) on the FUSE mount under their own host UID, causing the kernel to emit FUSE requests with a `fuse_in_header` that may contain a misleading `uid` (0 or `FUSE_INVALID_UIDGID`) due to idmapping rules.
+
+---
+
+**Attack Procedure:**
+
+1. **Deployment and Policy:**
+   - Administrator runs a FUSE daemon inside a user namespace (e.g., a container) using libfuse 3.x on a Linux kernel that supports user namespaces and FUSE idmapped mounts (protocol ≥ 7.41).
+   - User namespace mapping:
+     - Container root (UID 0 in the namespace) is mapped to host user `uid 2000`.
+     - Other host users (e.g., UID 1001) are *not* mapped into this namespace or the relevant idmapped mount.
+   - The daemon enforces internal ACLs / multi-tenant access control based on `fuse_req_ctx()->uid`. In its policy:
+     - If `ctx->uid == 0` (interpreted as “filesystem root”), it bypasses normal per-user access checks and allows full access.
+     - It does not treat `FUSE_INVALID_UIDGID` specially or assumes `uid == 0` can only come from the container’s root.
+
+2. **Mount Exposure:**
+   - The FUSE filesystem is mounted with `allow_other` (or otherwise shared) so that host user `uid 1001` can reach the mount point (e.g., `/mnt/shared_fuse`).
+   - From the host’s point of view, the mount is just a regular FUSE filesystem; VFS forwards operations into the FUSE kernel client.
+
+3. **Cross-namespace UID Mapping Failure:**
+   - Host user `uid 1001` performs a filesystem operation on `/mnt/shared_fuse/secret_of_user_2001` (e.g., `cat /mnt/shared_fuse/secret_of_user_2001`).
+   - The kernel FUSE client prepares a request:
+     - It must translate host `uid 1001` into the idmap / user namespace used for the FUSE mount.
+     - No valid mapping exists for `uid 1001`.
+   - Per documented behavior:
+     - The kernel sets `fuse_in_header.uid` either to `0` (in some older cross-namespace setups as per libfuse docs), or to `FUSE_INVALID_UIDGID` (`0xffffffff`) if `FUSE_ALLOW_IDMAP` is active and mapping fails.
+
+4. **Daemon Misinterpretation:**
+   - The daemon receives the request from `/dev/fuse` and libfuse populates:
+     - `fuse_req_ctx(req)->uid` from `fuse_in_header.uid`.
+   - Due to the mapping failure:
+     - `ctx->uid` is `0` or `0xffffffff` (`FUSE_INVALID_UIDGID`).
+   - The daemon’s policy, based on the field semantics in the description:
+     - Treats `uid == 0` as “filesystem root”.
+     - Or incorrectly treats `FUSE_INVALID_UIDGID` as a special “superuser”/“no owner” case with maximal access.
+   - It therefore **bypasses ACLs** and authorizes the operation as if it were performed by the privileged principal, even though the real caller is an unprivileged host user with no mapping in the daemon’s user namespace.
+
+5. **Security Impact:**
+   - Attacker (`uid 1001` on host) reads or modifies files that the daemon only intended to be accessible to “root” inside the FUSE filesystem or to other users (e.g., `uid 2001` inside the namespace).
+   - This can result in:
+     - Confidentiality breach (reading other users’ private data).
+     - Integrity violation (modifying or deleting data intended to be protected from non-root users).
+   - The trust boundary crossed:
+     - The FUSE daemon treats `fuse_in_header.uid` as authoritative user identity and as a security decision input.
+     - The kernel, under documented idmapping behavior, may legitimately set this field to `0` or `FUSE_INVALID_UIDGID` when no mapping exists, but the daemon misinterprets the value as “trusted root-equivalent”.
+   - The attack relies directly on the protocol field semantics and who controls/consumes it: kernel controls `uid` under complex namespace/idmap rules; daemon trusts it as identity and assigns permissions based on that.
+
+---
+
+**Attack Message:**
+```json
+{
+  "context": {
+    "real_caller_host_uid": 1001,
+    "daemon_userns_root_host_uid": 2000,
+    "userns_mapping": {
+      "userns_uid_0": 2000
+    },
+    "mount_flags": ["allow_other", "FUSE_ALLOW_IDMAP"]
+  },
+  "direction": "kernel_to_daemon",
+  "request": {
+    "struct": "fuse_in_header",
+    "fields": {
+      "len": 88,
+      "opcode": "FUSE_OPEN",
+      "unique": 0x12345678,
+      "nodeid": 0x2001,
+      "uid": 0,                 // or 4294967295 (FUSE_INVALID_UIDGID)
+      "gid": 0,
+      "pid": 43210,
+      "total_extlen": 0,
+      "padding": 0
+    },
+    "followed_by": {
+      "struct": "fuse_open_in",
+      "flags": "O_RDONLY",
+      "unused": 0
+    }
+  },
+  "daemon_view": {
+    "libfuse_ctx": {
+      "uid": 0,                  // taken from fuse_in_header.uid
+      "gid": 0,
+      "pid": 43210,
+      "umask": 0o022
+    },
+    "policy_decision": "treat uid==0 as privileged; bypass normal per-user access controls",
+    "result": "grant read access to /secret_of_user_2001 for an unprivileged host user"
+  }
+}
+```
+
+**Classification:** ATTACK

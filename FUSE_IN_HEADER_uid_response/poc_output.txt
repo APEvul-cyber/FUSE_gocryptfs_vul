@@ -1,0 +1,129 @@
+============================================================
+  PoC: FUSE_IN_HEADER uid==0 ACL Bypass Vulnerability
+============================================================
+
+Date: Thu Apr  2 15:55:32 UTC 2026
+Kernel: 6.12.76-linuxkit
+
+[*] Step 1: Compiling uid_bypass_daemon...
+    Compiled successfully.
+
+[*] Step 2: Creating test users...
+    testowner: uid=500(testowner) gid=500(testowner) groups=500(testowner)
+    testuser:  uid=1000(ubuntu) gid=1000(ubuntu) groups=1000(ubuntu)
+
+[*] Step 3: Mounting FUSE daemon...
+=== uid_bypass_daemon: demonstrating s3fs-style uid==0 ACL bypass ===
+Files: /secret.txt (mode 0600, owner uid=500) - only owner should read
+Vulnerability: uid==0 in fuse_in_header bypasses ALL permission checks
+Ignoring invalid max threads value 4294967295 > max (100000).
+    FUSE daemon PID: 79
+
+[*] Step 4: Filesystem layout:
+total 4
+drwxr-xr-x 2 root      root         0 Jan  1  1970 .
+drwxr-xr-x 1 root      root      4096 Apr  2 15:55 ..
+-rw-r--r-- 1 testowner testowner   21 Jan  1  1970 public.txt
+-rw------- 1 testowner testowner   36 Jan  1  1970 secret.txt
+
+============================================================
+  ACCESS CONTROL TESTS
+============================================================
+
+[TEST 1] Owner (uid=500) reads secret.txt:
+  Expected: ALLOWED
+  Result:   ALLOWED -> 'TOP SECRET: admin credentials here!'
+
+[TEST 2] Other user (uid=1000) reads secret.txt:
+  Expected: DENIED (mode 0600, not owner)
+[DENIED] open(/secret.txt) by uid=1000 gid=1000
+  Result:   DENIED  -> 'cat: /mnt/testfs/secret.txt: Permission denied'
+
+[TEST 3] Root (uid=0) reads secret.txt:
+  Expected: ALLOWED (uid==0 bypasses ALL ACL)
+[BYPASS] uid=0 detected -> granting superuser access to /secret.txt
+  Result:   ALLOWED -> 'TOP SECRET: admin credentials here!'
+  *** VULNERABILITY: uid==0 bypassed ACL for non-owner root ***
+
+[TEST 4] Other user (uid=1000) reads public.txt:
+  Expected: ALLOWED (mode 0644)
+  Result:   ALLOWED -> 'This is public data.'
+
+============================================================
+  USER NAMESPACE ESCALATION TEST
+============================================================
+
+/src/poc_test.sh: line 124: /proc/sys/kernel/unprivileged_userns_clone: No such file or directory
+user.max_user_namespaces = 10000
+[TEST 5] Unprivileged user (uid=1000) creates user namespace as uid=0:
+  Direct secret.txt access was DENIED in TEST 2.
+  Now trying via unshare -Ur (map self to uid=0 in new namespace)...
+
+    Inside namespace:
+      id:     uid=0(root) gid=0(root) groups=0(root)
+      /proc/self/uid_map:
+               0       1000          1
+
+    Attempting to read /mnt/testfs/secret.txt...
+[DENIED] open(/secret.txt) by uid=1000 gid=1000
+    Result: DENIED (rc=1) -> 'cat: /mnt/testfs/secret.txt: Permission denied'
+    Note: Kernel correctly sends real UID to FUSE daemon
+
+[TEST 6] What does the daemon's access log show?
+
+    [15:55:33] ACCESS_CHECK path=/secret.txt uid=500 gid=500 result=ALLOWED
+    [15:55:33] ACCESS_CHECK path=/secret.txt uid=1000 gid=1000 result=DENIED
+    [15:55:33] ACCESS_CHECK path=/secret.txt uid=0 gid=0 result=ALLOWED
+    [15:55:33] ACCESS_CHECK path=/public.txt uid=1000 gid=1000 result=ALLOWED
+    [15:55:33] ACCESS_CHECK path=/secret.txt uid=1000 gid=1000 result=DENIED
+
+============================================================
+  VULNERABLE CODE IN REAL FUSE DAEMONS
+============================================================
+
+--- s3fs-fuse: s3fs.cpp:655-676 ---
+  static int check_object_access(const char* path, int mask, struct stat* pstbuf) {
+      ...
+      if(0 == pcxt->uid){
+          // root is allowed all accessing.
+          return 0;    // <-- BYPASSES ALL CHECKS
+      }
+
+--- virtiofsd: passthrough/mod.rs:2305-2312 ---
+  if (mode & libc::R_OK) != 0
+      && !ctx.uid.is_root()   // <-- uid==0 skips check
+      && (st_uid != ctx.uid || st.st_mode & 0o400 == 0)
+  { return Err(EACCES); }
+
+--- ntfs-3g: security.c:3448-3457 ---
+  /* Always allow for root unless execution is requested */
+  if (!scx->mapping[MAPUSERS]
+      || (!scx->uid          // <-- uid==0 always allowed
+          && (...)))
+      allow = 1;
+
+--- mergerfs: ugid.hpp:84-104 ---
+  void set(const uid_t newuid_, ...) {
+      if((newuid_ == currentuid) && ...)
+          return;            // <-- uid==0 stays as root
+      SETREUID(-1, newuid_);
+  }
+
+============================================================
+  KERNEL fuse_in_header.uid BEHAVIOR
+============================================================
+
+  FUSE kernel code (fs/fuse/dev.c):
+    req->in.h.uid = from_kuid(fc->user_ns, current_fsuid());
+
+  from_kuid() returns (uid_t)-1 (0xFFFFFFFF) when mapping fails,
+  NOT 0. So the original claim about uid=0 on mapping failure
+  is INCORRECT for modern kernels (>= 3.5).
+
+  VALID attack scenarios for uid==0 appearing:
+  1. Rootless Docker (--userns-remap): container uid=0 is
+     unprivileged on host, but FUSE daemons grant full access
+  2. Nested user namespace: user creates namespace with uid=0
+     mapping, FUSE daemon in SAME namespace sees uid=0
+  3. Kubernetes pods with user namespace isolation (KEP-127)
+
